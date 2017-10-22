@@ -1,0 +1,588 @@
+#! /usr/bin/python
+import socket
+import sys
+from urllib.parse import urlparse
+from struct import *
+import random
+
+dest_url = sys.argv[1] 
+url = urlparse(dest_url)
+
+# Get the Local IP of the host
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.connect(('facebook.com', 80))
+src_ipaddr = sock.getsockname()[0]
+# print 'source address : ', src_ipaddr
+del sock
+
+# Get the hostname, path from url
+dest_ipaddr = socket.gethostbyname(url.netloc)
+
+# Initializing the varible to store the data
+# If url does not include the path, create index.html
+if url.path == "" :
+	filename = "index.html"
+else :
+	len_of_path = len(url.path)
+	last_char = url.path[len_of_path-1]
+	if last_char == "/" :
+		filename = "index.html"
+	else:
+		path_name = url.path.rsplit("/",1)
+		filename = path_name[1]
+
+
+#---------------------------------------------------------------------------------------------------------------------------------
+# Send a SYN signal
+# Create a sender's raw socket using SOCK_RAW/IPPROTO_RAW , receiver's socket, and port number for the communication
+send_raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) 
+recv_raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+port_number = random.randint(0,65535)
+data_list = {}
+
+# Calculate Checksum and return
+def checksum(data):
+        if (len(data)%2 != 0):
+                data = data + chr(0)
+        sum = 0
+        for i in range(0, len(data), 2):
+                temp_sum = ord(data[i]) + (ord(data[i+1]) << 8)
+                sum = sum + temp_sum
+        
+        sum = (sum >> 16) + (sum & 0xffff)
+        sum = sum + (sum >> 16)
+        sum = ~sum & 0xffff
+        return sum
+
+
+# Initialize IP header fields
+ip_ver = 4
+ip_ihl = 5
+ip_tos = 0
+ip_total_leg = 0
+ip_id = 54321
+ip_frag_off = 0
+ip_ttl = 255
+ip_protocol = socket.IPPROTO_TCP
+ip_chksum = 0
+ip_src_addr = socket.inet_aton(src_ipaddr)
+ip_dest_addr = socket.inet_aton(dest_ipaddr)
+
+# Shift ip_ver 4 bits left side and add ip_ihl 4 bits to make it first element   
+add_ip_ihl_ver = (ip_ver << 4 ) + ip_ihl
+# '!' represents the pack format string in order, 'B' represents unsigned char,
+# 'H' represents unsigned short, 's' is used instead of 'I' so that the result can be later fed to socket.inet_ntoa() 
+# to obtain the IP address in actual IP address format, and '4' is used as ip address  "4s"  
+ip_header = pack('!BBHHHBBH4s4s', add_ip_ihl_ver, 
+                ip_tos, ip_total_leg, ip_id, ip_frag_off,
+		ip_ttl, ip_protocol, ip_chksum, ip_src_addr, 
+		ip_dest_addr)
+
+
+# Initialize TCP header fields
+
+tcp_src_port = port_number
+# destination port
+tcp_dest_port = 80   
+tcp_seq = 40
+tcp_ack_seq = 0
+tcp_doff = 5 
+tcp_fin = 0
+tcp_syn = 1
+tcp_rst = 0
+tcp_psh = 0
+tcp_ack = 0
+tcp_urg = 0
+# maximum allowed window size
+tcp_wndw = socket.htons (5840)    
+tcp_chksum = 0
+tcp_urg_ptr = 0
+tcp_offset_res = (tcp_doff << 4)
+tcp_flags = tcp_fin + (tcp_syn << 1) + (tcp_rst << 2) + (tcp_psh <<3) + (tcp_ack << 4) + (tcp_urg << 5)
+# '!' represents the pack format string in order, 'B' represents unsigned char, 
+# 'H' represents unsigned short, and 'L' represents unsigned long
+tcp_header = pack('!HHLLBBHHH' , tcp_src_port, tcp_dest_port, 
+                  tcp_seq, tcp_ack_seq, tcp_offset_res, tcp_flags,  
+		  tcp_wndw, tcp_chksum, tcp_urg_ptr)
+
+# Initialize the data to be send
+send_data = ''
+reserved_data = 0
+protocol = socket.IPPROTO_TCP
+tcp_leng = len(tcp_header) + len(send_data) 
+pseudo_pkt = pack('!4s4sBBH' , ip_src_addr, ip_dest_addr, reserved_data, protocol, tcp_leng)
+pseudo_pkt = pseudo_pkt + tcp_header + send_data
+
+tcp_checksum = checksum(pseudo_pkt)
+ 
+# Create the tcp header with calculated checksum
+tcp_header = pack('!HHLLBBH' , tcp_src_port, tcp_dest_port, tcp_seq, 
+                  tcp_ack_seq, tcp_offset_res, tcp_flags,  tcp_wndw) \
+           + pack('H', tcp_checksum) \
+           + pack('!H', tcp_urg_ptr)
+ 
+# Create the packet including ip header, tcp header and send data
+send_packet = ip_header + tcp_header + send_data
+
+ip_checksum = checksum(send_packet)
+
+ip_header = pack('!BBHHHBB', add_ip_ihl_ver, ip_tos, ip_total_leg, 
+                 ip_id, ip_frag_off, ip_ttl, ip_protocol) \
+          + pack( 'H',ip_checksum) \
+          + pack('!4s4s', ip_src_addr, ip_dest_addr)
+
+send_packet1 = ip_header + tcp_header + send_data
+
+# Send the created packet to destination address
+send_raw_sock.sendto(send_packet1, (dest_ipaddr, 80))
+# print "Sent SYN signal"
+	
+#----------------------------------------------------------------------------------------------------------------------------------------
+# Unpack the Acknowledgement
+# Initialize the buffer where packets are queued 
+# buffer_pkt = 65535
+
+while True:
+	recv_pkt = recv_raw_sock.recvfrom(65535)
+	recv_pkt_ack = recv_pkt[0]
+	ip_hdr_recv = recv_pkt_ack[0:20]
+	validate_checksum_ip = checksum(ip_hdr_recv)
+       
+        # print validate_checksum_ip
+	ip_header_recv = unpack('!BBHHHBBH4s4s' ,ip_hdr_recv)
+	
+	ver_ihl = ip_header_recv[0]
+	ip_ver_recv = ver_ihl >> 4
+	ip_ihl_recv = ver_ihl & 0xF
+	len_iph_recv = ip_ihl_recv * 4
+	ip_checksum_recv = ip_header_recv[7]
+	ip_src_addr_recv = socket.inet_ntoa(ip_header_recv[8])
+	ip_dest_addr_recv = socket.inet_ntoa(ip_header_recv[9])
+	
+	tcp_hdr_recv = recv_pkt_ack[len_iph_recv:len_iph_recv+20]
+	#print 'ip length', len_iph_recv
+	tcp_header_recv = unpack('!HHLLBBHHH' , tcp_hdr_recv)
+	
+	src_port_recv = tcp_header_recv[0]
+	dest_port_recv = tcp_header_recv[1]
+	seq_number_recv = tcp_header_recv[2]
+	ack_recv = tcp_header_recv[3]
+	tcp_header_validate = pack('!HHLLBBHHH', tcp_header_recv[0],tcp_header_recv[1], 
+	                           tcp_header_recv[2], tcp_header_recv[3], tcp_header_recv[4], 
+				   tcp_header_recv[5], tcp_header_recv[6], 0, tcp_header_recv[8])
+	
+	tcp_leng_validate = len(tcp_header_validate) + len(recv_pkt_ack[40:])
+	pseudo_pkt_validate = pack('!4s4sBBH' , ip_header_recv[8], ip_header_recv[9],
+                                   0, ip_header_recv[6], tcp_leng_validate)
+	pseudo_pkt_validate = pseudo_pkt_validate + tcp_header_validate + recv_pkt_ack[40:]
+
+	tcp_checksum_validate = checksum(pseudo_pkt_validate)
+	tcp_checksum_validate = tcp_checksum_validate >> 8 | ((tcp_checksum_validate & 0x00ff) << 8)
+
+#----------------------------------------------------------------------------------------------------------------------------------
+# send a Acknowledgement  
+	if (validate_checksum_ip == 0 and tcp_checksum_validate == tcp_header_recv[7] 
+                and ip_src_addr_recv == dest_ipaddr and ip_dest_addr_recv == src_ipaddr 
+                and tcp_header_recv[5] == 18 and tcp_header_recv[1] == port_number ):
+		
+		ip_ver = 4
+		ip_ihl = 5
+		ip_tos = 0
+		ip_total_leg = 0
+		ip_id = 54321
+		ip_frag_off = 0
+		ip_ttl = 255
+		ip_protocol = socket.IPPROTO_TCP
+		ip_chksum = 0
+		ip_src_addr = socket.inet_aton (src_ipaddr)
+		ip_dest_addr = socket.inet_aton (dest_ipaddr)
+		# Shift ip_ver 4 bits left side and add ip_ihl 4 bits to make it first element 
+		add_ip_ihl_ver = (ip_ver << 4 ) + ip_ihl
+		# '!' represents the pack format string in order, 'B' represents unsigned char, 
+		# 'H' represents unsigned short, 's' is used instead of 'I' so that the result can be later fed to socket.inet_ntoa() 
+		# to obtain the IP address in actual IP address format, and '4' is used as ip address  "4s"  
+		ip_header = pack('!BBHHHBBH4s4s', add_ip_ihl_ver, ip_tos, 
+		                 ip_total_leg, ip_id, ip_frag_off, ip_ttl, 
+				 ip_protocol, ip_chksum, ip_src_addr, ip_dest_addr)
+		
+
+		# Initialize TCP header fields
+		tcp_src_port = port_number
+		tcp_dest_port = 80   # destination port
+		tcp_seq = tcp_header_recv[3]
+		tcp_ack_seq = tcp_header_recv[2] + 1
+		tcp_doff = 5 
+		tcp_fin = 0
+		tcp_syn = 0
+		tcp_rst = 0
+		tcp_psh = 0
+		tcp_ack = 1
+		tcp_urg = 0
+		tcp_wndw = socket.htons(5840)    #maximum allowed window size
+		tcp_chksum = 0
+		tcp_urg_ptr = 0
+		tcp_offset_res = (tcp_doff << 4)
+		tcp_flags = tcp_fin + (tcp_syn << 1) + (tcp_rst << 2) + (tcp_psh <<3) + (tcp_ack << 4) + (tcp_urg << 5)
+
+	        # '!' represents the pack format string in order, 'B' represents unsigned char, 
+		# 'H' represents unsigned short, and 'L' represents unsigned long
+		tcp_header = pack('!HHLLBBHHH' , tcp_src_port, 
+		                  tcp_dest_port, tcp_seq, tcp_ack_seq, 
+				  tcp_offset_res, tcp_flags,  tcp_wndw, 
+				  tcp_chksum, tcp_urg_ptr)
+		
+		ack_data = ''
+		ip_src_addr = socket.inet_aton (src_ipaddr)
+		ip_dest_addr = socket.inet_aton (dest_ipaddr)
+		reserved_data = 0
+		protocol = socket.IPPROTO_TCP
+		tcp_leng = len(tcp_header) + len(ack_data)
+	
+		pseudo_pkt = pack('!4s4sBBH' , ip_src_addr, ip_dest_addr, reserved_data, protocol, tcp_leng)
+		pseudo_pkt = pseudo_pkt + tcp_header + ack_data
+		tcp_checksum = checksum(pseudo_pkt)
+		
+		# Create the tcp header with calculated checksum
+		tcp_header = pack('!HHLLBBH' , tcp_src_port, tcp_dest_port, 
+		                  tcp_seq, tcp_ack_seq, tcp_offset_res, tcp_flags, tcp_wndw) \
+			   + pack('H' , tcp_checksum) \
+			   + pack('!H' , tcp_urg_ptr)
+		
+		# Create the packet including ip header, tcp header and send data
+		ack_pkt = ip_header + tcp_header + ack_data
+		
+		ip_checksum = checksum(ack_pkt)
+		
+		ip_header = pack('!BBHHHBB', add_ip_ihl_ver, ip_tos, ip_total_leg, ip_id, 
+		                 ip_frag_off, ip_ttl, ip_protocol) \
+			  + pack('H', ip_checksum) \
+			  + pack('!4s4s', ip_src_addr, ip_dest_addr)
+		ack_pkt1 = ip_header + tcp_header + ack_data
+
+		# send_ack_raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+		# send the created packet to destination address
+		send_raw_sock.sendto(ack_pkt1, (dest_ipaddr, 80))
+		break
+		
+		
+# send http data 
+ip_ver = 4
+ip_ihl = 5
+ip_tos = 0
+ip_total_leg = 0
+ip_id = 54321
+ip_frag_off = 0
+ip_ttl = 255
+ip_protocol = socket.IPPROTO_TCP
+ip_chksum = 0
+ip_src_addr = socket.inet_aton (src_ipaddr)
+ip_dest_addr = socket.inet_aton (dest_ipaddr)
+		
+# Shift ip_ver 4 bits left side and add ip_ihl 4 bits to make it first element 
+add_ip_ihl_ver = (ip_ver << 4 ) + ip_ihl
+# '!' represents the pack format string in order, 'B' represents unsigned char, 
+# 'H' represents unsigned short, 's' is used instead of 'I' so that the the result can be later fed to$
+ip_header = pack('!BBHHHBBH4s4s', add_ip_ihl_ver, ip_tos, ip_total_leg, 
+                 ip_id, ip_frag_off, ip_ttl, ip_protocol, ip_chksum, 
+		 ip_src_addr, ip_dest_addr)
+		
+
+# Initialize TCP header fields
+tcp_src_port = port_number
+tcp_dest_port = 80   # destination port
+tcp_seq = tcp_header_recv[3]
+tcp_ack_seq = tcp_header_recv[2] + 1
+tcp_doff = 5
+tcp_fin = 0
+tcp_syn = 0
+tcp_rst = 0
+tcp_psh = 1
+tcp_ack = 1
+tcp_urg = 0
+tcp_wndw = socket.htons(5840)    #maximum allowed window size
+tcp_chksum = 0
+tcp_urg_ptr = 0
+tcp_offset_res = (tcp_doff << 4)
+tcp_flags = tcp_fin + (tcp_syn << 1) + (tcp_rst << 2) + (tcp_psh <<3) + (tcp_ack << 4) + (tcp_urg << 5)
+
+# '!' represents the pack format string in order, 'B' represents unsigned char, 'H' represents unsigned short, and 'L' represents unsigned long
+tcp_header = pack('!HHLLBBHHH' , tcp_src_port, tcp_dest_port, tcp_seq, 
+                  tcp_ack_seq, tcp_offset_res, tcp_flags,  tcp_wndw, 
+		  tcp_chksum, tcp_urg_ptr)
+
+http_data = 'GET {} HTTP/1.0\n\n'.format(dest_url)
+# print http_data
+
+ip_src_addr = socket.inet_aton (src_ipaddr)
+ip_dest_addr = socket.inet_aton (dest_ipaddr)
+reserved_data = 0
+protocol = socket.IPPROTO_TCP
+tcp_leng = len(tcp_header) + len(http_data)
+
+pseudo_pkt = pack('!4s4sBBH' , ip_src_addr, ip_dest_addr, reserved_data, protocol, tcp_leng)
+pseudo_pkt = pseudo_pkt + tcp_header + http_data
+tcp_checksum = checksum(pseudo_pkt)
+		
+# Create the tcp header with calculated checksum
+tcp_header = pack('!HHLLBBH' , tcp_src_port, tcp_dest_port, tcp_seq, 
+                  tcp_ack_seq, tcp_offset_res, tcp_flags, tcp_wndw) \
+	   + pack('H', tcp_checksum) \
+	   + pack('!H', tcp_urg_ptr)
+# Create the packet including ip header, tcp header and send data
+http_pkt = ip_header + tcp_header + http_data
+
+ip_checksum = checksum(http_pkt)
+
+ip_header = pack('!BBHHHBB', add_ip_ihl_ver, ip_tos, ip_total_leg, ip_id, 
+                ip_frag_off, ip_ttl, ip_protocol) \
+	  + pack('H', ip_checksum) \
+	  + pack('!4s4s', ip_src_addr, ip_dest_addr)
+http_pkt1 = ip_header + tcp_header + http_data
+
+		
+# Send the created packet to destination address
+send_raw_sock.sendto(http_pkt1, (dest_ipaddr, 80))
+# print "http request sent"
+
+while True:
+	recv_pkt = recv_raw_sock.recvfrom(65535)
+	recv_pkt_http = recv_pkt[0]
+	ip_hdr_recv = recv_pkt_http[0:20]
+	ip_header_recv = unpack('!BBHHHBBH4s4s' ,ip_hdr_recv)
+
+	ver_ihl = ip_header_recv[0]
+	ip_ver_recv = ver_ihl >> 4
+	ip_ihl_recv = ver_ihl & 0xF
+	len_iph_recv = ip_ihl_recv * 4
+	ip_checksum_recv = ip_header_recv[7]
+	ip_src_addr_recv = socket.inet_ntoa(ip_header_recv[8])
+	ip_dest_addr_recv = socket.inet_ntoa(ip_header_recv[9])
+
+
+	tcp_hdr_recv = recv_pkt_http[len_iph_recv:len_iph_recv+20]
+	
+	tcp_header_recv = unpack('!HHLLBBHHH' , tcp_hdr_recv)    
+
+	src_port_recv = tcp_header_recv[0]
+	dest_port_recv = tcp_header_recv[1]
+	seq_number_recv = tcp_header_recv[2]
+	ack_recv = tcp_header_recv[3]
+	
+        # print '\n first tcp ack'
+	
+	while True:
+		recv_pkt = recv_raw_sock.recvfrom(65535) 
+		recv_pkt_http_ack = recv_pkt[0]	
+		ip_hdr_recv = recv_pkt_http_ack[0:20]
+		data_recv = recv_pkt_http_ack[40:] 
+				
+		ip_header_recv = unpack('!BBHHHBBH4s4s' ,ip_hdr_recv)
+
+		ver_ihl = ip_header_recv[0]
+		ip_ver_recv = ver_ihl >> 4
+		ip_ihl_recv = ver_ihl & 0xF
+		len_iph_recv = ip_ihl_recv * 4
+		ip_checksum_recv = ip_header_recv[7]
+		ip_src_addr_recv = socket.inet_ntoa(ip_header_recv[8])
+		ip_dest_addr_recv = socket.inet_ntoa(ip_header_recv[9])
+		
+		validate_checksum_ip = checksum(ip_hdr_recv)
+
+	        # print validate_checksum_ip
+
+		tcp_hdr_recv = recv_pkt_http_ack[len_iph_recv:len_iph_recv+20]
+		tcp_header_recv = unpack('!HHLLBBHHH' , tcp_hdr_recv)
+		
+		tcp_header_validate = pack('!HHLLBBHHH', tcp_header_recv[0],tcp_header_recv[1], 
+		                           tcp_header_recv[2], tcp_header_recv[3], tcp_header_recv[4], 
+					   tcp_header_recv[5], tcp_header_recv[6], 0, tcp_header_recv[8])
+
+		tcp_leng_validate = len(tcp_header_validate) + len(recv_pkt_http_ack[40:])
+		pseudo_pkt_validate = pack('!4s4sBBH' , ip_header_recv[8], ip_header_recv[9],
+                                           0, ip_header_recv[6], tcp_leng_validate)
+		pseudo_pkt_validate = pseudo_pkt_validate + tcp_header_validate + recv_pkt_http_ack[40:]
+
+		tcp_checksum_validate = checksum(pseudo_pkt_validate)
+		tcp_checksum_validate = tcp_checksum_validate >> 8 | ((tcp_checksum_validate & 0x00ff) << 8)
+				
+		src_port_recv = tcp_header_recv[0]
+		dest_port_recv = tcp_header_recv[1]
+		seq_number_recv = tcp_header_recv[2]
+		ack_recv = tcp_header_recv[3]
+		
+		data_len = len(data_recv)
+
+		if ( validate_checksum_ip == 0 and tcp_checksum_validate == tcp_header_recv[7] 
+                             and ip_src_addr_recv == dest_ipaddr and ip_dest_addr_recv == src_ipaddr 
+                             and (tcp_header_recv[5] == 16 or tcp_header_recv[5] == 24) 
+                             and tcp_header_recv[1] == port_number and len(data_recv) > 0):
+			
+		        data_list[seq_number_recv]= data_recv
+
+		        ip_ver = 4
+		        ip_ihl = 5
+		        ip_tos = 0
+		        ip_total_leg = 0
+		        ip_id = 54321
+		        ip_frag_off = 0
+		        ip_ttl = 255
+		        ip_protocol = socket.IPPROTO_TCP
+		        ip_chksum = 0
+		        ip_src_addr = socket.inet_aton (src_ipaddr)
+		        ip_dest_addr = socket.inet_aton (dest_ipaddr)
+		        # Shift ip_ver 4 bits left side and add ip_ihl 4 bits to make it first element
+		        add_ip_ihl_ver = (ip_ver << 4 ) + ip_ihl
+		        # '!' represents the pack format string in order, 'B' represents unsigned char, 
+			#'H' represents unsigned short, 's' is used instead of 'I' so that the the result can be later
+		        ip_header = pack('!BBHHHBBH4s4s', add_ip_ihl_ver, ip_tos, ip_total_leg, ip_id, 
+                                         ip_frag_off, ip_ttl, ip_protocol, ip_chksum, ip_src_addr, ip_dest_addr)
+
+                        # Initialize TCP header fields
+		        tcp_src_port = port_number
+		        tcp_dest_port = 80   # destination port
+		        tcp_seq = tcp_header_recv[3]
+		        tcp_ack_seq = tcp_header_recv[2] + data_len
+		        tcp_doff = 5
+		        tcp_fin = 0
+		        tcp_syn = 0
+		        tcp_rst = 0
+		        tcp_psh = 0
+		        tcp_ack = 1
+		        tcp_urg = 0
+		        tcp_wndw = socket.htons(5840)    #maximum allowed window size
+		        tcp_chksum = 0
+		        tcp_urg_ptr = 0
+		        tcp_offset_res = (tcp_doff << 4)
+		        tcp_flags = tcp_fin + (tcp_syn << 1) + (tcp_rst << 2) + (tcp_psh <<3) + (tcp_ack << 4) + (tcp_urg << 5)
+
+			#'!' represents the pack format string in order, 'B' represents unsigned char, 
+			#'H' represents unsigned short, and 'L' represents unsigned long
+		        tcp_header = pack('!HHLLBBHHH' , tcp_src_port, tcp_dest_port,
+			                  tcp_seq, tcp_ack_seq, tcp_offset_res, tcp_flags, 
+					  tcp_wndw, tcp_chksum, tcp_urg_ptr)
+		        ack_data = ''
+		        ip_src_addr = socket.inet_aton (src_ipaddr)
+		        ip_dest_addr = socket.inet_aton (dest_ipaddr)
+		        reserved_data =0
+		        protocol = socket.IPPROTO_TCP
+		        tcp_leng = len(tcp_header) + len(ack_data)
+
+		        pseudo_pkt = pack('!4s4sBBH' , ip_src_addr, ip_dest_addr, reserved_data, protocol, tcp_leng)
+		        pseudo_pkt= pseudo_pkt + tcp_header + ack_data
+		        tcp_checksum = checksum(pseudo_pkt)
+                        # Create the tcp header with calculated checksum
+		        tcp_header = pack('!HHLLBBH' , tcp_src_port, tcp_dest_port, tcp_seq, 
+			                  tcp_ack_seq, tcp_offset_res, tcp_flags,  tcp_wndw) \
+				   + pack('H' , tcp_checksum) \
+				   + pack('!H' , tcp_urg_ptr)
+                        # Create the packet including ip header, tcp header and send data
+		        ack_pkt = ip_header + tcp_header + ack_data
+		        ip_checksum = checksum(ack_pkt)
+
+		        ip_header = pack('!BBHHHBB', add_ip_ihl_ver, ip_tos, ip_total_leg, 
+			                 ip_id, ip_frag_off, ip_ttl, ip_protocol) \
+				  + pack('H', ip_checksum) \
+				  + pack('!4s4s', ip_src_addr, ip_dest_addr)
+		        ack_pkt1 = ip_header + tcp_header + ack_data
+
+                        # Send the created packet to destination address
+		        send_raw_sock.sendto(ack_pkt1, (dest_ipaddr, 80))
+		        expected_ack = tcp_header_recv[2] + data_len
+
+		if (ip_src_addr_recv == dest_ipaddr and ip_dest_addr_recv == src_ipaddr 
+                        and (tcp_header_recv[5] == 17 or tcp_header_recv[5] == 25)  
+                        and tcp_header_recv[1] == port_number ):
+					
+                        # print 'fin packet received'					
+			data_list[seq_number_recv]= data_recv
+			
+			ip_ver = 4
+			ip_ihl = 5
+			ip_tos = 0
+			ip_total_leg = 0
+			ip_id = 54321
+			ip_frag_off = 0
+			ip_ttl = 255
+			ip_protocol = socket.IPPROTO_TCP
+			ip_chksum = 0
+			ip_src_addr = socket.inet_aton (src_ipaddr)
+			ip_dest_addr = socket.inet_aton (dest_ipaddr)
+			# Shift ip_ver 4 bits left side and add ip_ihl 4 bits to make it first element 
+			add_ip_ihl_ver = (ip_ver << 4 ) + ip_ihl
+			# '!' represents the pack format string in order, 'B' represents unsigned char,
+			# 'H' represents unsigned short, 's' is used instead of 'I' so that the the result can be later fed to$
+			ip_header = pack('!BBHHHBBH4s4s', add_ip_ihl_ver, ip_tos, ip_total_leg, 
+			                 ip_id, ip_frag_off, ip_ttl, ip_protocol, 
+					 ip_chksum, ip_src_addr, ip_dest_addr)
+					
+			# Initialize TCP header fields
+			tcp_src_port = port_number
+			tcp_dest_port = 80   # destination port
+			tcp_seq = tcp_header_recv[3]
+			tcp_ack_seq = tcp_header_recv[2] + 1
+			tcp_doff = 5
+			tcp_fin = 1
+			tcp_syn = 0
+			tcp_rst = 0
+			tcp_psh = 0
+			tcp_ack = 1
+			tcp_urg = 0
+			tcp_wndw = socket.htons(5840)    #maximum allowed window size
+			tcp_chksum = 0
+			tcp_urg_ptr = 0
+			tcp_offset_res = (tcp_doff << 4)
+			tcp_flags = tcp_fin + (tcp_syn << 1) + (tcp_rst << 2) + (tcp_psh <<3) + (tcp_ack << 4) + (tcp_urg << 5)
+			# '!' represents the pack format string in order, 'B' represents unsigned char,
+			# 'H' represents unsigned short, and 'L' represents unsigned long
+			tcp_header = pack('!HHLLBBHHH' , tcp_src_port, tcp_dest_port, 
+			                  tcp_seq, tcp_ack_seq, tcp_offset_res, tcp_flags, 
+					  tcp_wndw, tcp_chksum, tcp_urg_ptr)
+
+			fin_data = ''
+			ip_src_addr = socket.inet_aton (src_ipaddr)
+			ip_dest_addr = socket.inet_aton (dest_ipaddr)
+			reserved_data =0
+			protocol = socket.IPPROTO_TCP
+			tcp_leng = len(tcp_header) + len(fin_data)
+
+			pseudo_pkt = pack('!4s4sBBH' , ip_src_addr, ip_dest_addr, reserved_data, protocol, tcp_leng)
+			pseudo_pkt= pseudo_pkt + tcp_header + fin_data
+			tcp_checksum = checksum(pseudo_pkt)
+					
+
+			# Create the tcp header with calculated checksum
+			tcp_header = pack('!HHLLBBH' , tcp_src_port, tcp_dest_port, tcp_seq, 
+			                  tcp_ack_seq, tcp_offset_res, tcp_flags,  tcp_wndw) \
+				   + pack('H' , tcp_checksum) \
+				   + pack('!H' , tcp_urg_ptr)
+			# Create the packet including ip header, tcp header and send data
+			fin_pkt = ip_header + tcp_header + fin_data
+			ip_checksum = checksum(fin_pkt)
+
+			ip_header = pack('!BBHHHBB', add_ip_ihl_ver, ip_tos, ip_total_leg, 
+			                 ip_id, ip_frag_off, ip_ttl, ip_protocol) \
+				  + pack('H', ip_checksum) \
+				  + pack('!4s4s', ip_src_addr, ip_dest_addr)
+			fin_pkt1 = ip_header + tcp_header + fin_data
+
+					
+			# Send the created packet to destination address
+			send_raw_sock.sendto(fin_pkt1, (dest_ipaddr, 80))
+			break
+	break
+
+file = open(filename , 'w')
+
+initial = 1
+for sequence in sorted(data_list):
+	
+	if initial == 1:
+                # print initial
+		data_one = data_list[sequence].split('\r\n\r\n', 1 )
+		data_list[sequence] = data_one[1]
+		file.writelines(data_list[sequence])
+		initial = 2
+	else:
+                # print initial
+		file.writelines(data_list[sequence])
+	
